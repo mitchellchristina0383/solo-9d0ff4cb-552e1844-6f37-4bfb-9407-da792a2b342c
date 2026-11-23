@@ -41,6 +41,10 @@ def create_app(db_path: str | None = None,
             scheduler.set_check_time(hhmm)
         except timeutil.InvalidTimeError as exc:
             flash(f"时刻无效：{exc}", "error")
+        except Exception as exc:  # 落库失败：设置与待执行计划保持原值
+            # 存储层事务已回滚，不调用 wake，避免任何状态变更。
+            flash(f"巡检时刻保存失败，设置与待执行计划保持原值：{exc}",
+                  "error")
         else:
             flash(f"每日巡检时刻已更新为 {hhmm}", "ok")
             _trigger()

@@ -2,9 +2,11 @@
 
 关键语义：
 - 读盘在锁外执行，因此读盘期间仍可通过网页修改巡检时刻；
-- 已开始的巡检保留原计划时间，未开始的巡检立即按新时刻重排；
+- 已开始的巡检保留原计划时间；改时刻会重排所有日期下尚未开始（pending）
+  的计划，因此跨纽约日期拨钟或重启后，计划与触发都以最近一次保存成功的
+  每日时刻为准；
 - 重启后补做当天已到计划时间但没有结果的巡检；
-  重启前已开始（running）的巡检仍沿用原来的计划时间；
+  重启前已开始（running）的巡检仍沿用原来的计划时间（即使重启后先改时刻）；
 - 同一当地日期只保留一份结果（见 Storage.save_result）；
 - 支持演练时钟：now() = 真实 UTC + 偏移量，偏移量持久化。
 """
@@ -83,14 +85,55 @@ class Scheduler:
 
     # ---- 巡检时刻设置 ---------------------------------------------------
     def set_check_time(self, hhmm: str) -> None:
-        """校验并保存每日巡检时刻；当天未开始的计划立即重排。"""
+        """校验并保存每日巡检时刻；所有未开始的计划立即重排。
+
+        - 设置与全部 pending 计划在同一事务内更新，失败则整体回滚，
+          设置和待执行计划都保持原值（异常向上抛给路由提示）；
+        - 已开始（running）或已完成（done/error）的计划固化原时刻，不动；
+        - 当天还没有计划行时，按新时刻补建一条；
+        - 读盘期间调用同样安全：进行中的日期不在 pending 列表里。
+        """
         timeutil.parse_hhmm(hhmm)  # 仅校验
         with self.lock:
-            self.storage.set_setting("check_time", hhmm)
-            self._replan_today_locked()
+            today = self.now_ny().date().isoformat()
+            replans = []
+            has_today = False
+            for plan in self.storage.list_pending_plans():
+                local_date = plan["local_date"]
+                has_today = has_today or local_date == today
+                replans.append(self._build_replan_locked(local_date, hhmm))
+            if not has_today:
+                # 当天无计划（尚未被 tick 建出，或当天计划已开始/完成）。
+                # 仅在当天确实没有计划行时补建；有行说明已开始或完成，
+                # 必须保留固化的原时刻。
+                if self.storage.get_plan(today) is None:
+                    replans.append(self._build_replan_locked(today, hhmm))
+            self.storage.apply_check_time_change(hhmm, replans)
+
+    def _build_replan_locked(self, local_date: str, hhmm: str):
+        """计算某当地日期在给定时刻下的 (date, hhmm, planned_utc, note)。"""
+        planned, note = timeutil.planned_instant(
+            datetime.fromisoformat(local_date).date(), hhmm
+        )
+        return (
+            local_date,
+            hhmm,
+            timeutil.to_utc_iso(planned),
+            note,
+        )
 
     def get_check_time(self) -> str:
         return self.storage.get_setting("check_time")
+
+    def _ensure_today_plan_locked(self) -> None:
+        """保证当天存在计划行：切换纽约当地日期或重启后首页即时可看。
+
+        只在缺行时按最近一次保存成功的时刻创建，已有计划（含 running
+        中断态）一律不覆盖。
+        """
+        today = self.now_ny().date().isoformat()
+        if self.storage.get_plan(today) is None:
+            self._replan_today_locked()
 
     def _replan_today_locked(self) -> None:
         """当天没有结果、且没有正在读盘时，按当前时刻重建当天计划。"""
@@ -146,7 +189,7 @@ class Scheduler:
             # 没有计划则建计划（含重启后、日期切换后）。
             plan = self.storage.get_plan(today)
             if plan is None:
-                self._replan_today_locked()
+                self._ensure_today_plan_locked()
                 plan = self.storage.get_plan(today)
             if plan is None:
                 return
@@ -212,6 +255,9 @@ class Scheduler:
         with self.lock:
             now_ny = self.now_ny()
             today = now_ny.date().isoformat()
+            # 切换纽约当地日期或重启后，首页立即按最近保存成功的时刻
+            # 生成当天计划，不等下一个轮询周期。
+            self._ensure_today_plan_locked()
             plan = self.storage.get_plan(today)
             result = self.storage.get_result(today)
             return {

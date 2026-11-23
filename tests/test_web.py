@@ -1,4 +1,5 @@
 import os
+import sqlite3
 import tempfile
 import unittest
 from datetime import datetime, timezone
@@ -86,6 +87,65 @@ class WebTest(unittest.TestCase):
         self.assertIn("读盘失败", body)
         self.assertIn("PermissionError", body)
         self.assertIn("volume not mounted", body)
+
+    def test_cross_day_change_time_then_back_shows_new_plan(self):
+        """首页试跨日改时刻：拨到次日改 11:00，拨回当天显示新计划。"""
+        self.sch.tick()  # 06-15 计划 09:00
+        # 拨到次日并保存新时刻
+        self.clock_now = datetime(2026, 6, 16, 12, 0, tzinfo=timezone.utc)
+        resp = self.client.post("/check-time",
+                                data={"check_time": "11:00"},
+                                follow_redirects=True)
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn("已更新为 11:00", resp.get_data(as_text=True))
+        self.assertEqual(self.storage.get_plan("2026-06-16")["check_time"],
+                         "11:00")
+
+        # 拨回当天：首页计划必须是 11:00，而不是旧的 09:00
+        self.clock_now = datetime(2026, 6, 15, 12, 0, tzinfo=timezone.utc)
+        body = self.client.get("/").get_data(as_text=True)
+        self.assertIn("11:00", body)
+        plan = self.storage.get_plan("2026-06-15")
+        self.assertEqual(plan["check_time"], "11:00")
+        # 11:00 EDT = 15:00Z
+        self.assertIn("2026-06-15T15:00:00+00:00", plan["planned_utc"])
+
+    def test_save_failure_flashes_and_keeps_old_values(self):
+        """保存失败：首页提示失败，设置和待执行计划保持原值。"""
+        self.sch.tick()
+        original_plan = dict(self.storage.get_plan("2026-06-15"))
+
+        class FailingStorage:
+            def __init__(self, inner):
+                self.inner = inner
+                self.path = inner.path
+
+            def __getattr__(self, name):
+                return getattr(self.inner, name)
+
+            def apply_check_time_change(self, hhmm, replans):
+                raise sqlite3.OperationalError("simulated disk failure")
+
+        self.sch.storage = FailingStorage(self.storage)
+        try:
+            resp = self.client.post("/check-time",
+                                    data={"check_time": "11:00"},
+                                    follow_redirects=True)
+        finally:
+            self.sch.storage = self.storage
+        self.assertEqual(resp.status_code, 200)
+        body = resp.get_data(as_text=True)
+        self.assertIn("保存失败", body)
+        self.assertIn("保持原值", body)
+        # 设置未变
+        self.assertEqual(self.storage.get_setting("check_time"), "09:00")
+        # 待执行计划未变
+        plan = self.storage.get_plan("2026-06-15")
+        self.assertEqual(plan["check_time"], original_plan["check_time"])
+        self.assertEqual(plan["planned_utc"], original_plan["planned_utc"])
+        self.assertEqual(plan["status"], "pending")
+        # 输入框仍显示原时刻
+        self.assertIn('value="09:00"', body)
 
 
 if __name__ == "__main__":

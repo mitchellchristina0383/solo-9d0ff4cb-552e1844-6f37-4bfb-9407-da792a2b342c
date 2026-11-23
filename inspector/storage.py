@@ -5,6 +5,7 @@ SQLite 自身打开 check_same_thread=False 以便调度线程与 Web 线程共�
 """
 from __future__ import annotations
 
+import os
 import sqlite3
 from typing import Optional
 
@@ -69,6 +70,55 @@ class Storage:
             "SELECT * FROM plans WHERE local_date=?", (local_date,)
         ).fetchone()
         return dict(row) if row else None
+
+    def list_pending_plans(self):
+        """所有仍处于 pending 的计划（按当地日期排序）。
+
+        running / done / error 的计划不在其中：已开始或已完成的巡检
+        不随时刻修改而重排。
+        """
+        rows = self.conn.execute(
+            "SELECT * FROM plans WHERE status='pending' ORDER BY local_date"
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def apply_check_time_change(self, hhmm: str, replans) -> None:
+        """原子地保存新巡检时刻并重排所有待执行计划。
+
+        replans 为 (local_date, check_time, planned_utc, dst_note) 元组序列，
+        调用方已保证其中只包含“当天尚无计划”或“仍为 pending”的日期。
+        任一 SQL 失败时整个事务回滚：设置与待执行计划都保持原值。
+        """
+        # 测试/演练钩子：FAIL_TRIGGER_PATH 指向的文件存在时，直接拒绝写入，
+        # 用来端到端验证“保存失败提示且状态不变”。默认未配置则永不触发。
+        trigger = os.environ.get("FAIL_TRIGGER_PATH")
+        if trigger and os.path.exists(trigger):
+            raise sqlite3.OperationalError(
+                "injected failure: fail trigger file present"
+            )
+        with self.conn:  # 正常退出提交，抛异常自动回滚
+            self.conn.execute(
+                "INSERT INTO settings(key, value) VALUES('check_time', ?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (hhmm,),
+            )
+            if getattr(self, "fail_next_check_time_change", False):
+                # 测试钩子：在同一事务内制造失败，验证整体回滚。
+                self.conn.execute("SELECT fail_on_purpose()")
+            for local_date, check_time, planned_utc, dst_note in replans:
+                # 冲突时只在计划仍为 pending 时覆盖；WHERE 不成立则静默跳过，
+                # 绝不改动 running/done/error 计划固化下来的时刻。
+                self.conn.execute(
+                    "INSERT INTO plans(local_date, check_time, planned_utc,"
+                    " dst_note, status, started_utc, finished_utc) "
+                    "VALUES(?,?,?,?,'pending',NULL,NULL) "
+                    "ON CONFLICT(local_date) DO UPDATE SET "
+                    "check_time=excluded.check_time, "
+                    "planned_utc=excluded.planned_utc, "
+                    "dst_note=excluded.dst_note "
+                    "WHERE plans.status='pending'",
+                    (local_date, check_time, planned_utc, dst_note),
+                )
 
     def upsert_plan(self, local_date: str, check_time: str, planned_utc: str,
                     dst_note: str, status: str = "pending",
