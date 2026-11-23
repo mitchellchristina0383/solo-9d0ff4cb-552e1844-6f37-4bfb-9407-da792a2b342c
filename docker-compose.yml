@@ -1,0 +1,23 @@
+services:
+  inspector:
+    build: .
+    image: volume-inspector:latest
+    container_name: volume-inspector
+    ports:
+      - "8000:8000"
+    environment:
+      # 被巡检的服务卷挂载点（容器内路径）
+      VOLUME_PATH: /volume
+      DB_PATH: /data/inspector.db
+      # 读盘延迟秒数，便于演练“读盘期间修改时刻”；生产可设 0
+      READ_DELAY_SECONDS: "3"
+      POLL_INTERVAL_SECONDS: "1"
+      TZ: America/New_York
+    volumes:
+      - inspector-data:/data
+      # 把宿主机根目录以只读方式挂成“服务卷”，也可换成命名卷
+      - /:/volume:ro
+    restart: unless-stopped
+
+volumes:
+  inspector-data:

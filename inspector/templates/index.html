@@ -1,0 +1,163 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>服务卷每日巡检台（纽约时间）</title>
+  <style>
+    :root { color-scheme: light; }
+    body { font-family: system-ui, "PingFang SC", "Microsoft YaHei", sans-serif;
+           margin: 0; background: #f4f6f8; color: #1f2933; }
+    header { background: #102a43; color: #fff; padding: 16px 24px; }
+    header h1 { margin: 0; font-size: 20px; }
+    header .sub { opacity: .75; font-size: 13px; margin-top: 4px; }
+    main { max-width: 960px; margin: 24px auto; padding: 0 16px; display: grid;
+           gap: 16px; }
+    .card { background: #fff; border-radius: 10px; padding: 18px 20px;
+            box-shadow: 0 1px 3px rgba(0,0,0,.08); }
+    .card h2 { margin: 0 0 12px; font-size: 16px; color: #243b53; }
+    dl { display: grid; grid-template-columns: 160px 1fr; gap: 6px 12px;
+         margin: 0; font-size: 14px; }
+    dt { color: #627d98; }
+    dd { margin: 0; }
+    form { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+    input, button { padding: 8px 10px; border-radius: 6px; border: 1px solid #bcccdc;
+                    font-size: 14px; }
+    button { background: #2563eb; color: #fff; border-color: #2563eb;
+             cursor: pointer; }
+    button.secondary { background: #486581; border-color: #486581; }
+    table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    th, td { text-align: left; padding: 8px 6px; border-bottom: 1px solid #e4e7eb; }
+    th { color: #627d98; font-weight: 600; }
+    .flash { padding: 10px 14px; border-radius: 8px; margin-bottom: 10px;
+             font-size: 14px; }
+    .flash.ok { background: #d3f9d8; color: #1b4332; }
+    .flash.error { background: #ffe3e3; color: #862e2e; }
+    .pill { display: inline-block; padding: 2px 8px; border-radius: 999px;
+            font-size: 12px; }
+    .pill.done { background: #d3f9d8; color: #1b4332; }
+    .pill.error { background: #ffe3e3; color: #862e2e; }
+    .pill.running { background: #fff3bf; color: #7a4f01; }
+    .pill.pending { background: #e7f5ff; color: #1864ab; }
+    .muted { color: #829ab1; font-size: 12px; }
+    code { background: #f0f4f8; padding: 1px 5px; border-radius: 4px; }
+  </style>
+</head>
+<body>
+<header>
+  <h1>服务卷每日巡检台</h1>
+  <div class="sub">按 America/New_York 当地时间每日巡检一次 · 卷路径 <code>{{ st.volume_path }}</code></div>
+</header>
+<main>
+  {% with messages = get_flashed_messages(with_categories=true) %}
+    {% for category, msg in messages %}
+      <div class="flash {{ category }}">{{ msg }}</div>
+    {% endfor %}
+  {% endwith %}
+
+  <section class="card">
+    <h2>当前时间（演练时钟）</h2>
+    <dl>
+      <dt>纽约当地时间</dt>
+      <dd>{{ st.now_ny.strftime('%Y-%m-%d %H:%M:%S %Z (UTC%z)') }}</dd>
+      <dt>演练偏移</dt>
+      <dd>{{ st.clock_offset_seconds | round(0) | int }} 秒
+        {% if st.clock_offset_seconds != 0 %}
+          <form method="post" action="{{ url_for('clock_reset') }}" style="display:inline">
+            <button class="secondary" type="submit">恢复真实时间</button>
+          </form>
+        {% endif %}
+      </dd>
+    </dl>
+  </section>
+
+  <section class="card">
+    <h2>每日巡检时刻</h2>
+    <form method="post" action="{{ url_for('update_check_time') }}">
+      <input type="time" name="check_time" value="{{ st.check_time }}" required>
+      <button type="submit">保存时刻</button>
+    </form>
+    <p class="muted" style="margin-bottom:0">
+      春季跳时跳过的时刻顺延到跳时后第一个有效分钟；秋季重复的时刻取第一次出现。
+      读盘期间修改时刻不会打断正在进行的巡检，仅影响尚未开始的计划。
+    </p>
+  </section>
+
+  <section class="card">
+    <h2>当天计划（{{ st.today }}）</h2>
+    {% if plan_view %}
+      <dl>
+        <dt>计划时刻（当地）</dt>
+        <dd>{{ plan_view.planned_local }}
+          <span class="pill {{ plan_view.status }}">
+            {% if st.reading %}读盘中{% else %}
+              {{ {'pending':'待执行','running':'执行中','done':'已完成','error':'读盘失败'}.get(plan_view.status, plan_view.status) }}
+            {% endif %}
+          </span>
+        </dd>
+        <dt>DST 处理</dt><dd>{{ plan_view.dst_label }}</dd>
+        <dt>设置的 HH:MM</dt><dd>{{ plan_view.check_time }}</dd>
+      </dl>
+    {% else %}
+      <p class="muted">当天计划尚未生成。</p>
+    {% endif %}
+  </section>
+
+  <section class="card">
+    <h2>当天结果（同一当地日期仅保留一份）</h2>
+    {% if result_view %}
+      <dl>
+        <dt>计划时间</dt><dd>{{ result_view.planned_local }}</dd>
+        <dt>完成时间</dt><dd>{{ result_view.finished_local }}</dd>
+        {% if result_view.error %}
+          <dt>读盘错误</dt><dd><span class="pill error">错误</span> {{ result_view.error }}</dd>
+        {% else %}
+          <dt>实际可用字节数</dt><dd><strong>{{ "{:,}".format(result_view.available_bytes) }}</strong> bytes</dd>
+        {% endif %}
+      </dl>
+    {% else %}
+      <p class="muted">当天暂无巡检结果。</p>
+    {% endif %}
+  </section>
+
+  <section class="card">
+    <h2>演练时钟控制</h2>
+    <form method="post" action="{{ url_for('clock_set') }}" style="margin-bottom:10px">
+      <input type="text" name="utc_time" placeholder="设定到 UTC 时刻，如 2026-03-08T13:00" size="34">
+      <button type="submit">设定时钟</button>
+    </form>
+    <form method="post" action="{{ url_for('clock_advance') }}">
+      <input type="number" step="any" name="seconds" placeholder="推进秒数" required>
+      <button type="submit">推进时钟</button>
+    </form>
+  </section>
+
+  <section class="card">
+    <h2>最近巡检记录</h2>
+    {% if st.recent %}
+      <table>
+        <thead><tr><th>当地日期</th><th>计划时间（当地）</th><th>状态</th><th>可用字节 / 错误</th></tr></thead>
+        <tbody>
+        {% for r in st.recent %}
+          <tr>
+            <td>{{ r.local_date }}</td>
+            <td>{{ r.check_time }}</td>
+            <td>
+              {% if r.error %}<span class="pill error">读盘失败</span>
+              {% else %}<span class="pill done">成功</span>{% endif %}
+            </td>
+            <td>
+              {% if r.error %}{{ r.error }}
+              {% else %}{{ "{:,}".format(r.available_bytes) }} bytes{% endif %}
+            </td>
+          </tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    {% else %}
+      <p class="muted">暂无历史记录。</p>
+    {% endif %}
+  </section>
+</main>
+</body>
+</html>
